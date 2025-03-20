@@ -1,0 +1,435 @@
+#!/bin/bash
+
+# Comprehensive troubleshooting script for Proxmox vmbr1 forwarding issues
+
+# Color formatting
+BOLD='\033[1m'
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[0;33m'
+BLUE='\033[0;34m'
+NC='\033[0m' # No Color
+
+# Logging functions
+log_info() { echo -e "${BLUE}[INFO]${NC} $1"; }
+log_success() { echo -e "${GREEN}[SUCCESS]${NC} $1"; }
+log_warning() { echo -e "${YELLOW}[WARNING]${NC} $1"; }
+log_error() { echo -e "${RED}[ERROR]${NC} $1"; }
+
+# Check if running as root
+if [ "$(id -u)" -ne 0 ]; then
+    log_error "This script must be run as root!"
+    exit 1
+fi
+
+# Variables
+MAIN_BRIDGE="vmbr0"
+NAT_BRIDGE="vmbr1"
+INTERFACES_FILE="/etc/network/interfaces"
+SYSCTL_FILE="/etc/sysctl.conf"
+BACKUP_DIR="/root/network_backups"
+TIMESTAMP=$(date +%Y%m%d%H%M%S)
+ISSUES=()
+
+# Create backup directory
+mkdir -p $BACKUP_DIR
+
+# Backup current configurations
+backup_configs() {
+    log_info "Creating backups of network configuration..."
+    cp $INTERFACES_FILE "$BACKUP_DIR/interfaces.$TIMESTAMP"
+    iptables-save > "$BACKUP_DIR/iptables.$TIMESTAMP"
+    cp $SYSCTL_FILE "$BACKUP_DIR/sysctl.conf.$TIMESTAMP"
+    log_success "Backups created in $BACKUP_DIR"
+}
+
+# Check network interfaces
+check_interfaces() {
+    log_info "Checking network interfaces..."
+    
+    # Get the interface that connects to the internet
+    MAIN_IFACE=$(ip route get 8.8.8.8 2>/dev/null | awk '{print $5; exit}')
+    [ -n "$MAIN_IFACE" ] && log_info "Internet interface: $MAIN_IFACE" || log_warning "Could not detect internet interface"
+    
+    # Check if bridges exist
+    if ! ip link show $MAIN_BRIDGE &>/dev/null; then
+        log_error "$MAIN_BRIDGE does not exist!"
+        ISSUES+=("main_bridge_missing")
+    else
+        log_success "$MAIN_BRIDGE exists"
+    fi
+    
+    if ! ip link show $NAT_BRIDGE &>/dev/null; then
+        log_error "$NAT_BRIDGE does not exist!"
+        ISSUES+=("nat_bridge_missing")
+    else
+        log_success "$NAT_BRIDGE exists"
+        
+        # Check if vmbr1 has an IP address
+        if ! ip addr show $NAT_BRIDGE | grep -q "inet "; then
+            log_error "$NAT_BRIDGE has no IP address!"
+            ISSUES+=("nat_bridge_no_ip")
+        else
+            NAT_IP=$(ip addr show $NAT_BRIDGE | grep "inet " | awk '{print $2}' | cut -d/ -f1)
+            NAT_CIDR=$(ip addr show $NAT_BRIDGE | grep "inet " | awk '{print $2}')
+            NAT_SUBNET=$(echo $NAT_CIDR | sed 's/\.[0-9]\+\//.0\//')
+            log_success "$NAT_BRIDGE has IP: $NAT_IP (subnet: $NAT_SUBNET)"
+        fi
+    fi
+    
+    # Check interfaces file configuration
+    if ! grep -q "^auto $MAIN_BRIDGE" $INTERFACES_FILE; then
+        log_error "$MAIN_BRIDGE not configured in $INTERFACES_FILE"
+        ISSUES+=("main_bridge_not_configured")
+    fi
+    
+    if ! grep -q "^auto $NAT_BRIDGE" $INTERFACES_FILE; then
+        log_error "$NAT_BRIDGE not configured in $INTERFACES_FILE"
+        ISSUES+=("nat_bridge_not_configured")
+    fi
+}
+
+# Check IP forwarding
+check_ip_forwarding() {
+    log_info "Checking IP forwarding..."
+    
+    # Check if IP forwarding is enabled in kernel
+    if [ "$(cat /proc/sys/net/ipv4/ip_forward)" -ne 1 ]; then
+        log_error "IP forwarding is disabled!"
+        ISSUES+=("ip_forwarding_disabled")
+    else
+        log_success "IP forwarding is enabled in kernel"
+    fi
+    
+    # Check if persistently enabled in sysctl.conf
+    if ! grep -q "^net.ipv4.ip_forward\s*=\s*1" $SYSCTL_FILE; then
+        log_warning "IP forwarding not persistently enabled in $SYSCTL_FILE"
+        ISSUES+=("ip_forwarding_not_persistent")
+    else
+        log_success "IP forwarding persistently enabled in $SYSCTL_FILE"
+    fi
+    
+    # Check for post-up command in interfaces
+    if ! grep -q "post-up.*echo.*ip_forward" $INTERFACES_FILE; then
+        log_warning "IP forwarding post-up command missing in $INTERFACES_FILE"
+        ISSUES+=("ip_forwarding_postup_missing")
+    else
+        log_success "IP forwarding post-up command exists in $INTERFACES_FILE"
+    fi
+}
+
+# Check NAT rules
+check_nat_rules() {
+    log_info "Checking NAT rules..."
+    
+    if [ -z "$NAT_SUBNET" ]; then
+        NAT_SUBNET=$(grep -A 10 "^auto $NAT_BRIDGE" $INTERFACES_FILE | grep "address" | head -1 | awk '{print $2}' | sed 's/\.[0-9]\+\//.0\//')
+        [ -z "$NAT_SUBNET" ] && NAT_SUBNET="192.168.1.0/24"
+    fi
+    
+    # Check for MASQUERADE rule
+    if ! iptables -t nat -C POSTROUTING -s "$NAT_SUBNET" -o $MAIN_BRIDGE -j MASQUERADE 2>/dev/null; then
+        log_error "MASQUERADE rule missing for $NAT_SUBNET via $MAIN_BRIDGE!"
+        ISSUES+=("masquerade_rule_missing")
+    else
+        log_success "MASQUERADE rule exists for $NAT_SUBNET via $MAIN_BRIDGE"
+    fi
+    
+    # Check for MASQUERADE in interfaces file
+    if ! grep -q "post-up.*iptables.*MASQUERADE" $INTERFACES_FILE; then
+        log_warning "MASQUERADE post-up command missing in $INTERFACES_FILE"
+        ISSUES+=("masquerade_postup_missing")
+    else
+        log_success "MASQUERADE post-up command exists in $INTERFACES_FILE"
+    fi
+    
+    # Check for iptables-persistent
+    if ! dpkg -l | grep -q "iptables-persistent"; then
+        log_warning "iptables-persistent not installed (rules won't persist after reboot)"
+        ISSUES+=("iptables_persistent_missing")
+    else
+        log_success "iptables-persistent is installed"
+    fi
+}
+
+# Check bridge configuration
+check_bridge_config() {
+    log_info "Checking bridge configuration..."
+    
+    # Check bridge-stp and bridge-fd settings
+    if ! grep -q "bridge-stp.*off" $INTERFACES_FILE; then
+        log_warning "bridge-stp off not configured"
+        ISSUES+=("bridge_stp_missing")
+    fi
+    
+    if ! grep -q "bridge-fd.*0" $INTERFACES_FILE; then
+        log_warning "bridge-fd 0 not configured"
+        ISSUES+=("bridge_fd_missing")
+    fi
+    
+    # Check bridge ports configuration
+    if ! grep -A 10 "^auto $NAT_BRIDGE" $INTERFACES_FILE | grep -q "bridge-ports"; then
+        log_warning "bridge-ports not configured for $NAT_BRIDGE"
+        ISSUES+=("bridge_ports_missing")
+    fi
+}
+
+# Check for MAC address conflicts
+check_mac_conflicts() {
+    log_info "Checking for MAC address conflicts..."
+    
+    declare -A MAC_ADDRESSES
+    
+    while read -r line; do
+        IFACE=$(echo $line | awk '{print $2}')
+        MAC=$(echo $line | awk '{print $4}')
+        
+        if [ -n "$MAC" ] && [ "$MAC" != "00:00:00:00:00:00" ]; then
+            if [ -n "${MAC_ADDRESSES[$MAC]}" ]; then
+                log_error "MAC address conflict: $MAC used by both ${MAC_ADDRESSES[$MAC]} and $IFACE"
+                ISSUES+=("mac_address_conflict")
+            else
+                MAC_ADDRESSES[$MAC]=$IFACE
+            fi
+        fi
+    done < <(ip link show | grep -A 1 "^[0-9]" | grep -v "^[0-9]" | grep "link/ether")
+}
+
+# Test connectivity
+test_connectivity() {
+    log_info "Testing connectivity..."
+    
+    # Check host connectivity
+    if ping -c 1 -W 2 8.8.8.8 &>/dev/null; then
+        log_success "Host has internet connectivity"
+    else
+        log_error "Host cannot reach the internet!"
+        ISSUES+=("host_no_internet")
+    fi
+    
+    # Try to trace packet flow
+    log_info "Checking packet flow..."
+    if [ -n "$NAT_SUBNET" ]; then
+        if ! iptables -C FORWARD -s "$NAT_SUBNET" -j ACCEPT 2>/dev/null; then
+            log_warning "No FORWARD rule allowing traffic from $NAT_SUBNET"
+            ISSUES+=("forward_rule_missing")
+        fi
+    fi
+}
+
+# Fix identified issues
+fix_issues() {
+    log_info "Fixing identified issues..."
+    
+    for issue in "${ISSUES[@]}"; do
+        case $issue in
+            "ip_forwarding_disabled")
+                log_info "Enabling IP forwarding..."
+                echo 1 > /proc/sys/net/ipv4/ip_forward
+                ;;
+                
+            "ip_forwarding_not_persistent")
+                log_info "Making IP forwarding persistent..."
+                if grep -q "net.ipv4.ip_forward" $SYSCTL_FILE; then
+                    sed -i 's/^#*net.ipv4.ip_forward.*/net.ipv4.ip_forward = 1/' $SYSCTL_FILE
+                else
+                    echo "net.ipv4.ip_forward = 1" >> $SYSCTL_FILE
+                fi
+                sysctl -p
+                ;;
+                
+            "masquerade_rule_missing")
+                log_info "Adding MASQUERADE rule..."
+                iptables -t nat -D POSTROUTING -s "$NAT_SUBNET" -o $MAIN_BRIDGE -j MASQUERADE 2>/dev/null || true
+                iptables -t nat -A POSTROUTING -s "$NAT_SUBNET" -o $MAIN_BRIDGE -j MASQUERADE
+                ;;
+                
+            "forward_rule_missing")
+                log_info "Adding FORWARD rule..."
+                iptables -D FORWARD -s "$NAT_SUBNET" -j ACCEPT 2>/dev/null || true
+                iptables -A FORWARD -s "$NAT_SUBNET" -j ACCEPT
+                ;;
+                
+            "iptables_persistent_missing")
+                log_info "Installing iptables-persistent..."
+                export DEBIAN_FRONTEND=noninteractive
+                apt-get update -qq
+                apt-get install -y iptables-persistent -qq
+                ;;
+                
+            "nat_bridge_missing"|"nat_bridge_not_configured")
+                log_info "Creating $NAT_BRIDGE configuration..."
+                # Add vmbr1 configuration if missing
+                if ! grep -q "^auto $NAT_BRIDGE" $INTERFACES_FILE; then
+                    NAT_IP=${NAT_IP:-"192.168.1.1"}
+                    NAT_SUBNET=${NAT_SUBNET:-"192.168.1.0/24"}
+                    
+                    cat >> $INTERFACES_FILE << EOF
+
+auto $NAT_BRIDGE
+iface $NAT_BRIDGE inet static
+    address $NAT_IP/24
+    bridge-ports none
+    bridge-stp off
+    bridge-fd 0
+    post-up echo 1 > /proc/sys/net/ipv4/ip_forward
+    post-up iptables -t nat -A POSTROUTING -s '$NAT_SUBNET' -o $MAIN_BRIDGE -j MASQUERADE
+    post-down iptables -t nat -D POSTROUTING -s '$NAT_SUBNET' -o $MAIN_BRIDGE -j MASQUERADE
+EOF
+                fi
+                ;;
+                
+            "ip_forwarding_postup_missing"|"masquerade_postup_missing"|"bridge_stp_missing"|"bridge_fd_missing"|"bridge_ports_missing")
+                log_info "Fixing bridge configuration in $INTERFACES_FILE..."
+                
+                # Create a temporary file for editing
+                TEMP_FILE=$(mktemp)
+                in_nat_section=false
+                fixed_post_up=false
+                fixed_bridge_params=false
+                
+                while IFS= read -r line; do
+                    echo "$line" >> $TEMP_FILE
+                    
+                    # Check if we're entering the vmbr1 section
+                    if [[ "$line" =~ ^iface\ $NAT_BRIDGE\ inet ]]; then
+                        in_nat_section=true
+                        
+                        # Add missing bridge parameters right after the interface line
+                        if [[ "$issue" == "bridge_stp_missing" || "$issue" == "bridge_fd_missing" || "$issue" == "bridge_ports_missing" ]] && [ "$fixed_bridge_params" == false ]; then
+                            if ! grep -A 5 "^iface $NAT_BRIDGE inet" $INTERFACES_FILE | grep -q "bridge-stp"; then
+                                echo "    bridge-stp off" >> $TEMP_FILE
+                            fi
+                            if ! grep -A 5 "^iface $NAT_BRIDGE inet" $INTERFACES_FILE | grep -q "bridge-fd"; then
+                                echo "    bridge-fd 0" >> $TEMP_FILE
+                            fi
+                            if ! grep -A 5 "^iface $NAT_BRIDGE inet" $INTERFACES_FILE | grep -q "bridge-ports"; then
+                                echo "    bridge-ports none" >> $TEMP_FILE
+                            fi
+                            fixed_bridge_params=true
+                        fi
+                    fi
+                    
+                    # If we're at the end of the vmbr1 section and haven't added post-up commands
+                    if [[ "$in_nat_section" == true && "$line" =~ ^$ ]] && [[ "$issue" == "ip_forwarding_postup_missing" || "$issue" == "masquerade_postup_missing" ]] && [ "$fixed_post_up" == false ]; then
+                        if ! grep -A 10 "^iface $NAT_BRIDGE inet" $INTERFACES_FILE | grep -q "post-up.*ip_forward"; then
+                            echo "    post-up echo 1 > /proc/sys/net/ipv4/ip_forward" >> $TEMP_FILE
+                        fi
+                        if ! grep -A 10 "^iface $NAT_BRIDGE inet" $INTERFACES_FILE | grep -q "post-up.*MASQUERADE"; then
+                            echo "    post-up iptables -t nat -A POSTROUTING -s '$NAT_SUBNET' -o $MAIN_BRIDGE -j MASQUERADE" >> $TEMP_FILE
+                            echo "    post-down iptables -t nat -D POSTROUTING -s '$NAT_SUBNET' -o $MAIN_BRIDGE -j MASQUERADE" >> $TEMP_FILE
+                        fi
+                        fixed_post_up=true
+                        in_nat_section=false
+                    fi
+                    
+                    # If we're starting a new section, we're no longer in vmbr1
+                    if [[ "$in_nat_section" == true && "$line" =~ ^(auto|iface|allow-|mapping) ]]; then
+                        in_nat_section=false
+                    fi
+                done < $INTERFACES_FILE
+                
+                # Replace the original file
+                mv $TEMP_FILE $INTERFACES_FILE
+                ;;
+                
+            "mac_address_conflict")
+                log_info "Fixing MAC address conflict..."
+                # Generate a new random MAC address
+                NEW_MAC=$(printf '52:54:00:%02x:%02x:%02x\n' $((RANDOM%256)) $((RANDOM%256)) $((RANDOM%256)))
+                
+                # Update MAC in interfaces file
+                if grep -q "hwaddress.*$NAT_BRIDGE" $INTERFACES_FILE; then
+                    sed -i "s/hwaddress.*$NAT_BRIDGE.*/hwaddress $NEW_MAC/" $INTERFACES_FILE
+                else
+                    sed -i "/^iface $NAT_BRIDGE inet/a\\    hwaddress $NEW_MAC" $INTERFACES_FILE
+                fi
+                log_success "Set new MAC address $NEW_MAC for $NAT_BRIDGE"
+                ;;
+        esac
+    done
+    
+    # Save iptables rules to make them persistent
+    if command -v netfilter-persistent &>/dev/null; then
+        log_info "Saving iptables rules with netfilter-persistent..."
+        netfilter-persistent save
+    elif [ -d "/etc/iptables" ]; then
+        log_info "Saving iptables rules to /etc/iptables/rules.v4..."
+        iptables-save > /etc/iptables/rules.v4
+    fi
+}
+
+# Restart networking
+restart_networking() {
+    log_info "Restarting networking services..."
+    
+    systemctl restart networking || {
+        log_warning "Failed to restart networking with systemctl, trying alternatives..."
+        if ip link show $NAT_BRIDGE &>/dev/null; then
+            ip link set $NAT_BRIDGE down
+            ip link set $NAT_BRIDGE up
+            if [ -n "$NAT_IP" ]; then
+                CIDR=$(grep -A 5 "^iface $NAT_BRIDGE inet" $INTERFACES_FILE | grep "address" | head -1 | awk '{print $2}' | grep -o "/[0-9]*")
+                [ -z "$CIDR" ] && CIDR="/24"
+                ip addr add $NAT_IP$CIDR dev $NAT_BRIDGE 2>/dev/null || true
+            fi
+        fi
+    }
+    
+    sleep 2
+    
+    # Verify bridges are up
+    for bridge in $MAIN_BRIDGE $NAT_BRIDGE; do
+        if ip link show $bridge 2>/dev/null | grep -q "state UP"; then
+            log_success "$bridge is UP"
+        else
+            log_warning "$bridge is not UP, trying to bring it up..."
+            ip link set $bridge up
+        fi
+    done
+    
+    # Final connectivity test
+    if ping -c 1 -W 2 8.8.8.8 &>/dev/null; then
+        log_success "Host still has internet connectivity after changes"
+    else
+        log_warning "Host lost internet connectivity! Check your configuration"
+    fi
+}
+
+# Main function
+main() {
+    echo -e "${BOLD}Proxmox vmbr1 NAT Troubleshooting Script${NC}"
+    echo "Checking and fixing NAT forwarding issues with vmbr1"
+    echo
+    
+    backup_configs
+    check_interfaces
+    check_ip_forwarding
+    check_nat_rules
+    check_bridge_config
+    check_mac_conflicts
+    test_connectivity
+    
+    echo
+    if [ ${#ISSUES[@]} -eq 0 ]; then
+        log_success "No issues detected with $NAT_BRIDGE NAT configuration"
+    else
+        log_warning "Detected ${#ISSUES[@]} issues with $NAT_BRIDGE NAT configuration"
+        for issue in "${ISSUES[@]}"; do
+            echo "  - $issue"
+        done
+        
+        echo
+        # Auto-fix all issues (no confirmation needed as requested by user)
+        log_info "Automatically fixing all detected issues..."
+        fix_issues
+        restart_networking
+        
+        echo
+        log_success "All fixes have been applied"
+        log_info "It's recommended to reboot your Proxmox host to ensure all changes take effect"
+    fi
+}
+
+# Execute the script
+main
